@@ -6,32 +6,25 @@ import asyncio
 import pandas as pd
 from datetime import datetime, timedelta
 
-# --- 1. THE FOOLPROOF STARTUP ENGINE ---
-# This section fixes the "Executable doesn't exist" error by forcing a fresh 
-# installation every time the app starts on the server.
+# --- 1. CRITICAL: BROWSER INSTALLER ---
+# This block forces the server to install Chromium and its Linux 'bones' (dependencies).
 if "browser_ready" not in st.session_state:
-    with st.spinner("🏗️ Urban Planning Engine: Installing browser..."):
-        # We use sys.executable to ensure we're in the right environment
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"])
-        st.session_state.browser_ready = True
+    with st.spinner("🏗️ Setting up Urban Planning Engine... (Wait 60s)"):
+        try:
+            # We use sys.executable to ensure we use the correct environment
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"], check=True)
+            st.session_state.browser_ready = True
+        except Exception as e:
+            st.error(f"Setup Error: {e}")
 
 from playwright.async_api import async_playwright
 
-# --- 2. USER INTERFACE ---
 st.set_page_config(page_title="Urban Planning Lead Gen", page_icon="🏗️", layout="wide")
 st.title("🏗️ Urban Planning Lead Generator")
-st.markdown("Automated lead sourcing for **Manchester** and **Westminster** councils.")
 
-with st.sidebar:
-    st.header("Search Settings")
-    days_back = st.slider("Days to look back", 1, 90, 14)
-    st.divider()
-    st.info("Hi Mark! Click the button below to start scanning.")
-
-# --- 3. THE SCRAPER ENGINE ---
-async def scrape_council(council_name, base_url, days):
+# --- 2. THE SCRAPER ENGINE ---
+async def fetch_leads(council_name, url, days_back):
     leads = []
-    # Urban planning specific keywords
     keywords = ["commercial", "retail", "shop", "office", "change of use", "development"]
     
     async with async_playwright() as p:
@@ -40,64 +33,45 @@ async def scrape_council(council_name, base_url, days):
         page = await browser.new_page()
         
         try:
-            # Navigate to Advanced Search
-            search_url = f"{base_url}/online-applications/search.do?action=advanced"
-            await page.goto(search_url, timeout=60000)
-            
-            # Fill in the date
-            start_date = (datetime.now() - timedelta(days=days)).strftime("%d/%m/%Y")
-            await page.fill("#applicationValidatedStart", start_date)
+            await page.goto(f"{url}/online-applications/search.do?action=advanced", timeout=60000)
+            date_str = (datetime.now() - timedelta(days=days_back)).strftime("%d/%m/%Y")
+            await page.fill("#applicationValidatedStart", date_str)
             await page.click("input[type='submit'][value='Search']")
             
-            # Scan results
             results = await page.query_selector_all(".searchresult")
             for res in results:
                 text = (await res.inner_text()).lower()
                 if any(k in text for k in keywords):
-                    header = await res.query_selector("a")
-                    title = await header.inner_text()
-                    link = await header.get_attribute("href")
+                    link_node = await res.query_selector("a")
                     leads.append({
                         "Council": council_name,
-                        "Title": title.strip(),
-                        "Link": base_url + link
+                        "Application": (await res.inner_text()).split('\n')[0],
+                        "Link": url + await link_node.get_attribute("href")
                     })
         except Exception as e:
-            st.error(f"Error at {council_name}: {str(e)}")
+            st.error(f"Error at {council_name}: {e}")
         finally:
             await browser.close()
     return leads
 
-# --- 4. ACTION BUTTON ---
-if st.button("🚀 Scan Councils Now"):
+# --- 3. THE ACTION ---
+if st.button("🚀 Scan Councils for Leads"):
     all_leads = []
-    targets = {
+    councils = {
         "Manchester": "https://pa.manchester.gov.uk",
         "Westminster": "https://idoxpa.westminster.gov.uk"
     }
     
-    with st.status("Gathering new planning applications...", expanded=True) as status:
-        for name, url in targets.items():
-            st.write(f"Scouting {name} Council...")
-            results = asyncio.run(scrape_council(name, url, days_back))
-            all_leads.extend(results)
+    with st.status("Gathering leads...", expanded=True) as status:
+        for name, url in councils.items():
+            st.write(f"Scouting {name}...")
+            data = asyncio.run(fetch_leads(name, url, 30))
+            all_leads.extend(data)
         status.update(label="Scanning Complete!", state="complete", expanded=False)
-    
-    if all_leads:
-        df = pd.DataFrame(all_leads)
-        st.success(f"Found {len(df)} potential commercial opportunities!")
-        st.balloons()
-        st.dataframe(df, use_container_width=True)
-        
-        # Download for Mark's records
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Export Leads to CSV", csv, "leads.csv", "text/csv")
-    else:
-        st.warning("No commercial leads found. Try a longer 'Look back' in the sidebar.")
 
-st.divider()
-st.caption("Securely hosted for Urban Planning Startup. 2026 Live Status.")
     if all_leads:
+        st.success(f"Found {len(all_leads)} leads for your startup!")
+        st.balloons()
         st.dataframe(pd.DataFrame(all_leads), use_container_width=True)
     else:
-        st.warning("No new leads found.")
+        st.warning("No new commercial applications found. Try again tomorrow!")
