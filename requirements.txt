@@ -2,4 +2,3 @@ streamlit
 playwright
 pandas
 openpyxl
-asyncio
