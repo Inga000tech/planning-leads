@@ -1,19 +1,21 @@
 import streamlit as st
 import os
+import sys
+import subprocess
 import asyncio
 import pandas as pd
 from datetime import datetime, timedelta
 
-# --- 1. CRITICAL: BROWSER INSTALLATION ---
-# This part ensures the cloud server downloads Chromium and all required "bones" (deps)
-# so Mark never sees the "Executable doesn't exist" error.
-if "playwright_setup" not in st.session_state:
-    with st.spinner("Initializing Lead Engine (Installing browser)..."):
-        # The --with-deps flag is the key fix for Linux cloud environments
-        os.system("python -m playwright install chromium --with-deps")
-        st.session_state.playwright_setup = True
+# --- 1. THE FOOLPROOF STARTUP ENGINE ---
+if "browser_ready" not in st.session_state:
+    with st.spinner("🏗️ Urban Planning Engine: Installing browser..."):
+        # We use sys.executable to find the correct Python environment
+        # and subprocess.run for better error handling than os.system
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"])
+        st.session_state.browser_ready = True
 
 from playwright.async_api import async_playwright
+# ... the rest of your app logic remains the same ...
 
 # --- 2. USER INTERFACE ---
 st.set_page_config(page_title="Planning Lead Pro", page_icon="🏢", layout="wide")
