@@ -6,9 +6,9 @@ import asyncio
 import pandas as pd
 from datetime import datetime, timedelta
 
-# --- 1. THE STEALTH ENGINE ---
+# --- 1. THE ENGINE ---
 if "browser_ready" not in st.session_state:
-    with st.spinner("🕵️ Opening Urban Planning Lead Scout..."):
+    with st.spinner("🕵️ Calibrating Stealth Engine..."):
         try:
             subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
             st.session_state.browser_ready = True
@@ -18,117 +18,107 @@ if "browser_ready" not in st.session_state:
 from playwright.async_api import async_playwright
 
 st.set_page_config(page_title="Urban Planning Lead Scout", page_icon="🏢", layout="wide")
-
-# --- 2. THE STARTUP DASHBOARD ---
 st.title("🏢 Urban Planning Lead Scout")
-st.markdown("Automated lead sourcing for **Manchester** and **Westminster** Councils.")
 
 with st.sidebar:
-    st.header("Lead Settings")
-    target_council = st.selectbox("Select Target Council", ["Manchester", "Westminster"])
-    weeks_to_scan = st.slider("Weeks to scan", 1, 8, 2)
+    st.header("Search Parameters")
+    target_council = st.selectbox("Select Council", ["Manchester", "Westminster"])
+    weeks_to_scan = st.slider("Weeks to scan", 1, 8, 4)
     st.divider()
-    if target_council == "Westminster":
-        st.warning("⚠️ **Alert:** Westminster is currently using manual lists due to a recent cyber incident.")
-    st.info("This tool targets **Prior Approvals** and **Commercial-to-Residential** leads.")
+    st.info("Directly for Urban Planning Startups.")
 
-# --- 3. THE "HANDSHAKE" SCRAPER ---
-async def scrape_manchester(base_url, weeks):
+# --- 2. THE ULTIMATE SCRAPER ---
+async def scrape_manchester_final(weeks):
     all_leads = []
     keywords = ["prior approval", "change of use", "conversion", "commercial", "class ma", "office", "retail"]
+    base_url = "https://pa.manchester.gov.uk/online-applications"
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        # Use a real browser signature to avoid being blocked
+        # Persistent context to keep cookies/session alive
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0 Safari/537.36")
         page = await context.new_page()
         
         try:
-            # STEP 1: The "Handshake" - Visit the Terms page first to set the cookie
-            st.write("🔓 Clearing Security Wall...")
-            await page.goto(f"{base_url}/online-applications/main.do?action=terms", timeout=60000)
+            # STEP 1: Go to the Weekly List page directly
+            st.write("🔗 Connecting to Manchester...")
+            await page.goto(f"{base_url}/search.do?action=weeklyList", timeout=60000)
             
-            # Click the 'Accept' button (handles multiple variations)
-            accept_button = await page.query_selector('input[type="submit"][value*="Accept"], input[name="agree"]')
-            if accept_button:
-                await accept_button.click()
+            # STEP 2: Check for Disclaimer/Terms
+            # We look for the "Accept" button. If it's there, we click it.
+            accept_btn = await page.query_selector('input[value="I Accept"], input[name="agree"], .button.primary')
+            if accept_btn:
+                st.write("🔓 Clearing Security Wall...")
+                await accept_btn.click()
+                # CRITICAL: Wait for the page to reload with the search form
                 await page.wait_for_load_state("networkidle")
-
-            # STEP 2: Navigate to Weekly List
-            st.write("📅 Accessing Weekly Register...")
-            await page.goto(f"{base_url}/online-applications/search.do?action=weeklyList", timeout=60000)
             
-            # Select 'Validated' apps
+            # STEP 3: Ensure we are on the search page
+            # If the server redirected us away, go back to Weekly List (the cookie is now set)
+            if not await page.query_selector("#weeklyListDisplayType"):
+                await page.goto(f"{base_url}/search.do?action=weeklyList", timeout=60000)
+
+            # STEP 4: Select 'Validated' apps
+            st.write("📅 Accessing Weekly Register...")
             await page.wait_for_selector("#weeklyListDisplayType", timeout=30000)
             await page.select_option("#weeklyListDisplayType", "validated")
             
-            # STEP 3: Loop through weeks
+            # STEP 5: Loop through weeks
             options = await page.query_selector_all("#week option")
             for i in range(min(len(options), weeks)):
-                # Refresh options
+                # Refresh options list
                 current_options = await page.query_selector_all("#week option")
                 week_val = await current_options[i].get_attribute("value")
                 week_text = await current_options[i].inner_text()
                 
-                st.write(f"🔍 Scanning Week: {week_text}")
+                st.write(f"🔍 Scanning: {week_text}")
                 await page.select_option("#week", week_val)
-                await page.click('input[type="submit"]')
+                # Use wait_for_navigation to ensure the results page loads
+                async with page.expect_navigation():
+                    await page.click('input[type="submit"]')
                 
-                # Wait for result table
-                try:
-                    await page.wait_for_selector(".searchresult", timeout=10000)
-                    results = await page.query_selector_all(".searchresult")
-                    for res in results:
-                        text = (await res.inner_text()).lower()
-                        if any(k in text for k in keywords):
-                            link_node = await res.query_selector("a")
-                            title = await link_node.inner_text()
-                            href = await link_node.get_attribute("href")
-                            all_leads.append({
-                                "Council": "Manchester",
-                                "Date": week_text,
-                                "Project": title.strip(),
-                                "Type": "PRIORITY" if "prior approval" in text else "Commercial",
-                                "Link": base_url + href
-                            })
-                    # Go back for next week
-                    await page.goto(f"{base_url}/online-applications/search.do?action=weeklyList")
-                except:
-                    await page.goto(f"{base_url}/online-applications/search.do?action=weeklyList")
-                    continue
-                    
+                # Scrape results
+                results = await page.query_selector_all(".searchresult")
+                for res in results:
+                    text = (await res.inner_text()).lower()
+                    if any(k in text for k in keywords):
+                        link_el = await res.query_selector("a")
+                        title = await link_el.inner_text()
+                        href = await link_el.get_attribute("href")
+                        all_leads.append({
+                            "Date": week_text,
+                            "Project": title.strip(),
+                            "Type": "PRIORITY" if "prior approval" in text else "Commercial",
+                            "Link": "https://pa.manchester.gov.uk" + href
+                        })
+                
+                # Go back to the search page for the next week
+                await page.goto(f"{base_url}/search.do?action=weeklyList")
+                await page.wait_for_selector("#week")
+
         except Exception as e:
             st.error(f"Technical Glitch: {e}")
         finally:
             await browser.close()
     return all_leads
 
-# --- 4. EXECUTION ---
+# --- 3. THE ACTION ---
 if st.button(f"🚀 Scout {target_council} Now"):
     if target_council == "Manchester":
-        with st.status("Scanning Manchester...", expanded=True) as status:
-            leads = asyncio.run(scrape_manchester("https://pa.manchester.gov.uk", weeks_to_scan))
-            status.update(label="Scout Complete!", state="complete")
+        with st.status("Searching Manchester...", expanded=True):
+            leads = asyncio.run(scrape_manchester_final(weeks_to_scan))
         
         if leads:
             df = pd.DataFrame(leads)
-            st.success(f"Found {len(df)} High-Value Leads!")
-            st.balloons()
-            st.dataframe(df, column_config={"Link": st.column_config.LinkColumn("View Case")}, use_container_width=True, hide_index=True)
-            st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "manchester_leads.csv")
+            st.success(f"Found {len(df)} Leads!")
+            st.dataframe(df, column_config={"Link": st.column_config.LinkColumn("View")}, use_container_width=True)
+            st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "leads.csv")
         else:
-            st.warning("No new commercial matches found in Manchester for this period.")
+            st.warning("No commercial leads found. The keywords might be too strict.")
 
     elif target_council == "Westminster":
-        st.error("🚨 **System Offline:** Westminster's portal is currently down due to a cyber incident.")
-        st.markdown("""
-        ### How to get leads for Westminster right now:
-        Westminster is publishing **manual Excel lists** while they repair their systems. 
-        1. Visit their [Temporary Register Page](https://www.westminster.gov.uk/planning-building-control-and-environmental-regulations/planning-applications/search-and-comment-planning-applications-and-register-email-notifications)
-        2. Download the latest **XLSX file** (Temporary Planning Register).
-        3. Search for "Prior Approval" or "Change of Use" inside that Excel file.
-        """)
-        st.link_button("Go to Westminster Temporary List", "https://www.westminster.gov.uk/planning-building-control-and-environmental-regulations/planning-applications/search-and-comment-planning-applications-and-register-email-notifications")
+        st.error("🚨 Westminster Portal is currently offline due to a cyber-attack.")
+        st.link_button("Go to Westminster Temporary Manual List", "https://www.westminster.gov.uk/planning-building-control-and-environmental-regulations/planning-applications/search-and-comment-planning-applications-and-register-email-notifications")
 
 st.divider()
-st.caption("Urban Planning Startup Tool | 2026 Live Lead Scout | Barcelona, Spain.")
+st.caption("Urban Planning Startup Tool | 2026 Live Status | Barcelona, Spain")
