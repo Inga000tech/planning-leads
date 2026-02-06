@@ -4,7 +4,7 @@ import sys
 import subprocess
 import asyncio
 import pandas as pd
-from datetime import datetime, timedelta
+from playwright.async_api import async_playwright
 
 # --- 1. ENGINE INITIALIZATION ---
 if "browser_ready" not in st.session_state:
@@ -15,8 +15,6 @@ if "browser_ready" not in st.session_state:
         except Exception as e:
             st.error(f"Setup Error: {e}")
 
-from playwright.async_api import async_playwright
-
 st.set_page_config(page_title="Urban Planning Lead Scout", page_icon="🏢", layout="wide")
 st.title("🏢 Urban Planning Lead Scout")
 
@@ -25,15 +23,14 @@ with st.sidebar:
     target_council = st.selectbox("Select Council", ["Manchester", "Westminster"])
     weeks_to_scan = st.slider("Weeks to look back", 1, 8, 2)
     st.divider()
-    include_validated = st.checkbox("Scan Validated (New)", value=True)
-    include_decided = st.checkbox("Scan Decided (Closed/Approved)", value=True)
-    st.info("Tailored for Urban Planning Startups.")
+    st.info("Targets: Prior Approvals & Change of Use.")
 
-# --- 2. THE MULTI-STAGE SCRAPER ---
-async def scrape_manchester_comprehensive(weeks, scan_types):
+# --- 2. THE SEQUENTIAL SCRAPER ---
+async def scrape_manchester_dual(weeks):
     all_leads = []
     keywords = ["prior approval", "change of use", "conversion", "commercial", "class ma", "office", "retail", "shop", "restaurant"]
     base_url = "https://pa.manchester.gov.uk/online-applications"
+    search_modes = ["validated", "decided"]
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -41,36 +38,52 @@ async def scrape_manchester_comprehensive(weeks, scan_types):
         page = await context.new_page()
         
         try:
-            # STEP 1: Handshake
+            # --- MANDATORY HANDSHAKE ---
+            st.write("🔑 Clearing Security Wall...")
             await page.goto(f"{base_url}/main.do?action=terms", timeout=60000)
-            accept_btn = await page.query_selector('input[type="submit"][value*="Accept"], input[name="agree"]')
-            if accept_btn:
-                await accept_btn.click()
+            accept = await page.query_selector('input[type="submit"][value*="Accept"]')
+            if accept: 
+                await accept.click()
                 await page.wait_for_load_state("networkidle")
-            
-            # STEP 2: Iterate through types (Validated/Decided)
-            for scan_type in scan_types:
-                st.write(f"📂 Preparing **{scan_type.capitalize()}** scan...")
+
+            for mode in search_modes:
+                st.write(f"📂 **Mode: {mode.upper()}**")
+                
+                # Navigate to Weekly List
                 await page.goto(f"{base_url}/search.do?action=weeklyList", timeout=60000)
                 
-                # Selection logic for radio buttons
-                radio_selector = f"input[value='{scan_type}']"
+                # RE-CHECK TERMS: If we get redirected back to terms, click accept again
+                if "terms" in page.url:
+                    accept = await page.query_selector('input[type="submit"][value*="Accept"]')
+                    if accept: await accept.click()
+                    await page.goto(f"{base_url}/search.do?action=weeklyList")
+
+                # SELECT THE RADIO BUTTON
+                # We use a broader selector to ensure it doesn't fail on partial matches
+                radio_selector = f"input[type='radio'][value='{mode}']"
                 await page.wait_for_selector(radio_selector, timeout=30000)
                 await page.click(radio_selector)
-
+                
                 # Fetch available weeks
-                options_elements = await page.query_selector_all("#week option")
-                week_values = []
-                for i in range(min(len(options_elements), weeks)):
-                    val = await options_elements[i].get_attribute("value")
-                    txt = await options_elements[i].inner_text()
-                    week_values.append((val, txt))
+                await page.wait_for_selector("#week", timeout=10000)
+                options = await page.query_selector_all("#week option")
+                week_list = []
+                for i in range(min(len(options), weeks)):
+                    val = await options[i].get_attribute("value")
+                    txt = await options[i].inner_text()
+                    week_list.append((val, txt))
 
-                for val, txt in week_values:
-                    st.write(f"🔍 Scanning {scan_type}: {txt}")
+                for val, txt in week_list:
+                    st.write(f"🔍 Scanning {mode} - {txt}")
                     await page.select_option("#week", val)
-                    await asyncio.gather(page.wait_for_navigation(), page.click('input[type="submit"][value="Search"]'))
                     
+                    # Search click
+                    await asyncio.gather(
+                        page.wait_for_load_state("networkidle"),
+                        page.click('input[type="submit"][value="Search"]')
+                    )
+                    
+                    # Scrape preliminary results
                     results = await page.query_selector_all(".searchresult")
                     for res in results:
                         content = (await res.inner_text()).lower()
@@ -79,76 +92,63 @@ async def scrape_manchester_comprehensive(weeks, scan_types):
                             title = await link_node.inner_text()
                             href = await link_node.get_attribute("href")
                             
-                            # Initial info from results page
-                            lead_data = {
+                            all_leads.append({
+                                "Mode": mode.upper(),
                                 "Week": txt,
-                                "Type": scan_type.upper(),
                                 "Purpose": title.strip(),
                                 "Link": "https://pa.manchester.gov.uk" + href,
-                                "Status": "Unknown",
-                                "Lead Info": "Checking..."
-                            }
-                            all_leads.append(lead_data)
+                                "Status": "Processing...",
+                                "Lead Info": "Processing..."
+                            })
+                    
+                    # Go back for next week and re-select mode
+                    await page.goto(f"{base_url}/search.do?action=weeklyList")
+                    await page.wait_for_selector(radio_selector)
+                    await page.click(radio_selector)
 
-            # STEP 3: Deep Scan for Lead Info (Applicant/Agent)
-            # We only do this for the matches to save time and avoid bans
+            # --- DEEP SCAN FOR CONTACTS ---
             if all_leads:
-                st.write("🕵️ Extracting Lead Info and Status...")
+                st.write("🕵️ Extracting Lead Names & Status...")
                 for lead in all_leads:
                     try:
                         await page.goto(lead["Link"], timeout=30000)
-                        # Extract Status
+                        # Grab Status
                         status_el = await page.query_selector("td:has-text('Status') + td")
-                        if status_el:
-                            lead["Status"] = await status_el.inner_text()
+                        if status_el: lead["Status"] = await status_el.inner_text()
                         
-                        # Navigate to Contacts/Further Info for the 'Lead'
+                        # Grab Applicant Name (Lead Info)
                         await page.click("text='Further Information'", timeout=5000)
-                        applicant_el = await page.query_selector("td:has-text('Applicant Name') + td")
-                        if applicant_el:
-                            lead["Lead Info"] = await applicant_el.inner_text()
+                        applicant = await page.query_selector("td:has-text('Applicant Name') + td")
+                        if applicant: lead["Lead Info"] = await applicant.inner_text()
                     except:
-                        lead["Lead Info"] = "View Link for Details"
-                        continue
+                        lead["Lead Info"] = "View Case Link"
 
         except Exception as e:
-            st.error(f"Scraper Error: {str(e)[:100]}")
-            await page.screenshot(path="debug.png")
-            st.image("debug.png")
+            st.error(f"Technical Glitch: {str(e)[:100]}")
+            await page.screenshot(path="error_state.png")
+            st.image("error_state.png", caption="Current view of the site")
         finally:
             await browser.close()
     return all_leads
 
-# --- 3. THE ACTION ---
+# --- 3. EXECUTION ---
 if st.button(f"🚀 Scout {target_council} Now"):
-    scan_types = []
-    if include_validated: scan_types.append("validated")
-    if include_decided: scan_types.append("decided")
-
-    if not scan_types:
-        st.warning("Please select at least one scan type (Validated or Decided).")
-    elif target_council == "Manchester":
-        with st.status(f"Scanning Manchester {scan_types}...", expanded=True):
-            leads = asyncio.run(scrape_manchester_comprehensive(weeks_to_scan, scan_types))
+    if target_council == "Manchester":
+        with st.status("Running Sequential Dual-Pass Scan...", expanded=True):
+            data = asyncio.run(scrape_manchester_dual(weeks_to_scan))
         
-        if leads:
-            df = pd.DataFrame(leads)
+        if data:
+            df = pd.DataFrame(data)
             st.success(f"Found {len(df)} High-Value Leads!")
             st.dataframe(df, use_container_width=True, hide_index=True)
-            st.download_button("📥 Export Lead List", df.to_csv(index=False).encode('utf-8'), "urban_leads.csv")
+            st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "leads.csv")
         else:
-            st.warning("No matches found. Try broadening keywords or the date range.")
+            st.warning("No commercial matches found. Try increasing the 'Look back' slider.")
 
     elif target_council == "Westminster":
-        st.error("🚨 Westminster Portal is currently offline due to a cyber incident.")
-        st.markdown("""
-        **Manual Lead Sourcing for Westminster (2026):**
-        1. Click the button below to access their Temporary Planning Register.
-        2. Download the latest **XLSX** file.
-        3. Filter Column **'Description'** for 'Change of Use' or 'Prior Approval'.
-        4. The **'Applicant'** column contains your lead info.
-        """)
-        st.link_button("Go to Westminster Temporary Register", "https://www.westminster.gov.uk/planning-building-control-and-environmental-regulations/planning-applications/search-and-comment-planning-applications-and-register-email-notifications")
+        st.error("🚨 Westminster Portal Offline (Cyber Incident)")
+        st.markdown("Westminster is currently publishing **manual XLSX files**. Use the button below to find the latest 'Temporary Planning Register'.")
+        st.link_button("Access Westminster Manual List", "https://www.westminster.gov.uk/planning-building-control-and-environmental-regulations/planning-applications/search-and-comment-planning-applications-and-register-email-notifications")
 
 st.divider()
-st.caption("Urban Planning Startup Tool | 2026 Live Status | Barcelona, Spain")
+st.caption("Urban Planning Startup Tool | Barcelona, Spain")
